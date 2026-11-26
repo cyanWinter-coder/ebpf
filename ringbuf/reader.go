@@ -16,6 +16,9 @@ import (
 var (
 	ErrClosed = os.ErrClosed
 	errEOR    = errors.New("end of ring")
+
+	errRecordBusy    = errors.New("ringbuf record is not complete")
+	errInvalidRecord = errors.New("invalid ringbuf record")
 )
 
 // poller abstracts platform-specific event notification.
@@ -65,6 +68,15 @@ type Record struct {
 
 	// The minimum number of bytes remaining in the ring buffer after this Record has been read.
 	Remaining int
+
+	// Sequence is the reader-local sequence number of this record. The first
+	// record has sequence one, and sequence numbers are contiguous unless one
+	// or more invalid records were skipped.
+	Sequence uint64
+
+	// LostSamples is the number of records skipped between the previous
+	// returned record and this one.
+	LostSamples uint64
 }
 
 // Reader reads [Record]s submitted to a BPF ringbuf.
@@ -124,9 +136,15 @@ func (r *Reader) ReadInto(rec *Record) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.raw.WithLease(func(s Lease) error {
-	retry:
-		data, remain, err := s.ReadSample()
+	if err := r.raw.enter(); err != nil {
+		return err
+	}
+	defer r.raw.leave()
+
+	lease := Lease{rr: r.raw}
+
+	for {
+		data, remain, err := lease.ReadSample()
 		if err != nil {
 			return err
 		}
@@ -134,11 +152,12 @@ func (r *Reader) ReadInto(rec *Record) error {
 		if data == nil {
 			// Consumer needs to advance even if the producer discarded the sample,
 			// since space was reserved for it in the ring.
-			s.Commit()
-
-			// Sample was discarded, try to read the next one.
-			goto retry
+			lease.Commit()
+			continue
 		}
+
+		rec.Sequence = lease.Sequence()
+		rec.LostSamples = lease.LostSamples()
 
 		if cap(rec.RawSample) < len(data) {
 			rec.RawSample = make([]byte, len(data))
@@ -150,11 +169,10 @@ func (r *Reader) ReadInto(rec *Record) error {
 		rec.Remaining = remain
 
 		// Advance the reader, invalidating the sample data.
-		s.Commit()
+		lease.Commit()
 
 		return nil
-	})
-
+	}
 }
 
 // BufferSize returns the size in bytes of the ring buffer's data portion.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,87 @@ type RawReader struct {
 	drainErr   error
 
 	inflight, closed atomic.Bool
+
+	// closeMu serializes ring teardown with progress calls that read mapped
+	// ring memory. Read calls are excluded by inflight instead.
+	closeMu sync.RWMutex
+
+	stats readerStats
+
+	// The following fields are only accessed by the goroutine that owns an
+	// inflight Lease.
+	nextSequence uint64
+	lastSkipped  uint64
+	lastSequence uint64
+	lastLost     uint64
+}
+
+// ReaderStats contains counters and progress information for a [Reader] or
+// [RawReader].
+type ReaderStats struct {
+	// Sequence is the sequence number most recently assigned to a record.
+	Sequence uint64
+
+	// ReadCount is the number of valid samples returned to callers.
+	ReadCount uint64
+
+	// ReadBytes is the total number of valid sample bytes returned.
+	ReadBytes uint64
+
+	// DiscardedCount is the number of samples discarded by the BPF producer.
+	DiscardedCount uint64
+
+	// SkippedCount is the number of invalid or incomplete ring records that
+	// were skipped.
+	SkippedCount uint64
+
+	// LostCount is the total sequence gap attributed to skipped records.
+	LostCount uint64
+
+	// ConsumedBytes is the number of ring bytes advanced past since the
+	// reader was created, including headers, alignment padding and skipped
+	// bytes.
+	ConsumedBytes uint64
+}
+
+// Stats is an alias for [ReaderStats].
+type Stats = ReaderStats
+
+type readerStats struct {
+	sequence       atomic.Uint64
+	readCount      atomic.Uint64
+	readBytes      atomic.Uint64
+	discardedCount atomic.Uint64
+	skippedCount   atomic.Uint64
+	lostCount      atomic.Uint64
+}
+
+func (s *readerStats) snapshot() ReaderStats {
+	return ReaderStats{
+		Sequence:       s.sequence.Load(),
+		ReadCount:      s.readCount.Load(),
+		ReadBytes:      s.readBytes.Load(),
+		DiscardedCount: s.discardedCount.Load(),
+		SkippedCount:   s.skippedCount.Load(),
+		LostCount:      s.lostCount.Load(),
+	}
+}
+
+// Stats returns a snapshot of reader counters and progress.
+func (rr *RawReader) Stats() ReaderStats {
+	rr.closeMu.RLock()
+	defer rr.closeMu.RUnlock()
+
+	stats := rr.stats.snapshot()
+	if progress, ok := rr.ring.(interface{ consumedBytes() uint64 }); ok {
+		stats.ConsumedBytes = progress.consumedBytes()
+	}
+	return stats
+}
+
+// Stats returns a snapshot of reader counters and progress.
+func (r *Reader) Stats() ReaderStats {
+	return r.raw.Stats()
 }
 
 var errConcurrent = errors.New("concurrent use of RawReader")
@@ -121,6 +203,9 @@ func (rr *RawReader) Close() error {
 		runtime.Gosched()
 	}
 
+	rr.closeMu.Lock()
+	defer rr.closeMu.Unlock()
+
 	return rr.ring.close()
 }
 
@@ -157,15 +242,49 @@ func (s Lease) ReadSample() (data []byte, remain int, err error) {
 	rr := s.rr
 
 	for {
+		if rr.closed.Load() {
+			return nil, 0, fmt.Errorf("ringbuf read: %w", ErrClosed)
+		}
+
 		// On Windows, the wait handle is only set when the reader is created, so we
 		// miss any wakeups that happened before. Do an opportunistic read to get
 		// any pending samples.
 		data, remain, err := rr.ring.readSample()
 		if err == nil {
+			if data == nil {
+				rr.stats.discardedCount.Add(1)
+			} else {
+				rr.stats.readCount.Add(1)
+				rr.stats.readBytes.Add(uint64(len(data)))
+				rr.advanceSequence()
+			}
 			return data, remain, nil
 		}
 
-		if err != errEOR {
+		switch {
+		case errors.Is(err, errRecordBusy):
+			// The producer is still updating the record. Yield instead of
+			// blocking in the poller, but stay responsive to Close.
+			if rr.closed.Load() {
+				return nil, 0, fmt.Errorf("ringbuf read: %w", ErrClosed)
+			}
+			if !rr.deadline.IsZero() && !time.Now().Before(rr.deadline) {
+				return nil, 0, fmt.Errorf("ringbuf read: %w", os.ErrDeadlineExceeded)
+			}
+			runtime.Gosched()
+			continue
+
+		case errors.Is(err, errInvalidRecord):
+			rr.stats.skippedCount.Add(1)
+			if rr.closed.Load() {
+				return nil, 0, fmt.Errorf("ringbuf read: %w", ErrClosed)
+			}
+			continue
+
+		case errors.Is(err, errEOR):
+			// Fall through to waiting below.
+
+		default:
 			return nil, 0, err
 		}
 
@@ -192,6 +311,36 @@ func (s Lease) Commit() {
 	s.rr.ring.commit()
 }
 
+// Sequence returns the sequence number assigned to the sample returned by the
+// most recent successful [Lease.ReadSample] call.
+func (s Lease) Sequence() uint64 {
+	return s.rr.lastSequence
+}
+
+// LostSamples returns the sequence gap attributed to skipped records before
+// the sample returned by the most recent successful [Lease.ReadSample] call.
+func (s Lease) LostSamples() uint64 {
+	return s.rr.lastLost
+}
+
+func (rr *RawReader) advanceSequence() {
+	skipped := rr.stats.skippedCount.Load()
+	lost := skipped - rr.lastSkipped
+	rr.lastSkipped = skipped
+
+	if rr.nextSequence == 0 {
+		rr.nextSequence = 1
+	}
+	rr.nextSequence += lost
+
+	rr.lastSequence = rr.nextSequence
+	rr.nextSequence++
+	rr.lastLost = lost
+
+	rr.stats.sequence.Store(rr.lastSequence)
+	rr.stats.lostCount.Add(lost)
+}
+
 // BufferSize returns the size in bytes of the ring buffer's data portion.
 func (rr *RawReader) BufferSize() int {
 	return rr.bufferSize
@@ -211,5 +360,11 @@ func (rr *RawReader) Flush() error {
 // consumer position. If the reader is batching commits, this may return an
 // inflated value.
 func (rr *RawReader) AvailableBytes() int {
+	rr.closeMu.RLock()
+	defer rr.closeMu.RUnlock()
+
+	if rr.closed.Load() {
+		return 0
+	}
 	return rr.ring.available()
 }
