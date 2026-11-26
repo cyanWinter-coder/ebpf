@@ -24,6 +24,7 @@ var (
 	// unnecessary memory allocations
 	sysErrKeyNotExist  = sys.Error(ErrKeyNotExist, unix.ENOENT)
 	sysErrKeyExist     = sys.Error(ErrKeyExist, unix.EEXIST)
+	sysErrMapFull      = sys.Error(ErrMapFull, unix.E2BIG)
 	sysErrNotSupported = sys.Error(ErrNotSupported, sys.ENOTSUPP)
 )
 
@@ -187,7 +188,9 @@ func wrapMapError(err error) error {
 	}
 
 	if errors.Is(err, unix.E2BIG) {
-		return fmt.Errorf("key too big for map: %w", err)
+		// E2BIG from map element operations means that an element could not
+		// be inserted because the map reached its MaxEntries limit.
+		return sysErrMapFull
 	}
 
 	return err

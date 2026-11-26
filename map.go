@@ -27,6 +27,7 @@ import (
 var (
 	ErrKeyNotExist      = errors.New("key does not exist")
 	ErrKeyExist         = errors.New("key already exists")
+	ErrMapFull          = errors.New("map is full")
 	ErrIterationAborted = errors.New("iteration aborted")
 	ErrMapIncompatible  = errors.New("map spec is incompatible with existing map")
 
@@ -313,6 +314,18 @@ func (ms *MapSpec) Compatible(m *Map) error {
 // Map represents a Map file descriptor.
 //
 // It is not safe to close a Map which is used by other goroutines.
+//
+// Methods may be called concurrently from multiple goroutines. Individual
+// element operations are atomic with respect to the kernel, but operations
+// spanning multiple keys (including batches) are not transactions: a
+// concurrent reader can observe any subset of the writes applied so far. Code
+// which needs a consistent view of several keys must build it out of single
+// Lookup calls under its own synchronization, or stage writes in a separate
+// map and switch over atomically at the application level.
+//
+// A Lookup of a missing key returns ErrKeyNotExist and leaves valueOut
+// untouched, so ignoring the error makes a zero value look like stored data.
+// Always check the error before consuming valueOut.
 //
 // Map operations taking `any` arguments are encoded using [sysenc.Marshal],
 // which is zero-copy for fixed-size types without padding as well as slices of
@@ -1034,6 +1047,9 @@ func (m *Map) Put(key, value any) error {
 }
 
 // Update changes the value of a key.
+//
+// Returns ErrMapFull if the map has reached its MaxEntries capacity and the
+// key is not yet present.
 func (m *Map) Update(key, value any, flags MapUpdateFlags) error {
 	if m.typ.hasPerCPUValue() {
 		return m.updatePerCPU(key, value, flags)
@@ -1391,6 +1407,15 @@ func (m *Map) batchLookupCmd(cmd sys.Cmd, cursor *MapBatchCursor, count int, key
 // simultaneously.
 // "keys" and "values" must be of type slice, a pointer
 // to a slice or buffer will not work.
+//
+// The operation is not transactional: the kernel applies elements one by one
+// and stops at the first failure, so concurrent readers may observe a
+// partially updated map. On error the returned count is the number of
+// elements applied before the failure; the failing element and all following
+// elements have not been processed.
+//
+// ErrMapFull is returned if the map reaches its MaxEntries capacity. Use
+// BatchUpdateChunks to split large inputs into multiple syscalls.
 func (m *Map) BatchUpdate(keys, values any, opts *BatchOptions) (int, error) {
 	if m.typ.hasPerCPUValue() {
 		return m.batchUpdatePerCPU(keys, values, opts)
@@ -1453,6 +1478,11 @@ func (m *Map) batchUpdatePerCPU(keys, values any, opts *BatchOptions) (int, erro
 
 // BatchDelete batch deletes entries in the map by keys.
 // "keys" must be of type slice, a pointer to a slice or buffer will not work.
+//
+// As with BatchUpdate, the operation stops at the first key which cannot be
+// deleted: the returned count is the number of deletions applied before the
+// failure and the remaining keys have not been processed. Use
+// BatchDeleteChunks to split large inputs into multiple syscalls.
 func (m *Map) BatchDelete(keys any, opts *BatchOptions) (int, error) {
 	count, err := sliceLen(keys)
 	if err != nil {
@@ -1503,6 +1533,133 @@ func batchCount(keys, values any) (int, error) {
 	return keysLen, nil
 }
 
+// batchChunk describes a single chunk of a chunked batch operation.
+//
+// Offsets index the user-provided input slices. For per-CPU maps the values
+// slice has PossibleCPU entries per key, so value offsets differ from key
+// offsets.
+type batchChunk struct {
+	KeyStart, KeyEnd     int
+	ValueStart, ValueEnd int
+}
+
+// batchChunks splits count elements into consecutive chunks of at most
+// chunkSize. valueMultiplier is 1 for regular maps and PossibleCPU for
+// per-CPU maps.
+func batchChunks(count, chunkSize, valueMultiplier int) []batchChunk {
+	chunks := make([]batchChunk, 0, (count+chunkSize-1)/chunkSize)
+	for start := 0; start < count; start += chunkSize {
+		end := min(start+chunkSize, count)
+		chunks = append(chunks, batchChunk{
+			KeyStart:   start,
+			KeyEnd:     end,
+			ValueStart: start * valueMultiplier,
+			ValueEnd:   end * valueMultiplier,
+		})
+	}
+	return chunks
+}
+
+// BatchResult reports the outcome of a chunked batch operation.
+//
+// The kernel stops processing a batch at the first element it cannot handle
+// and does not report which element failed. Failed therefore points at the
+// first element of the failing chunk, relative to the input slices; elements
+// at indexes smaller than Failed have been applied, everything from Failed
+// onward has not been attempted.
+type BatchResult struct {
+	// Completed is the number of elements applied successfully across all
+	// chunks.
+	Completed int
+	// Failed is the index of the first element which could not be applied.
+	// It is only valid when the operation returned an error.
+	Failed int
+}
+
+// BatchUpdateChunks applies keys and values in consecutive chunks of at most
+// chunkSize elements. It is a convenience wrapper around BatchUpdate for
+// inputs that are too large to process in a single syscall.
+//
+// keys and values must be slices of equal length. For per-CPU maps values
+// must contain one value per possible CPU for each key, so the values slice
+// is PossibleCPU times as long as the keys slice.
+//
+// Each chunk is an independent, non-transactional operation: concurrent
+// readers may observe a partially updated map between chunks, and a failure
+// leaves the elements processed by earlier chunks in place. On error the
+// returned BatchResult identifies how many elements were applied and where
+// processing stopped; the caller is responsible for retrying or rolling back.
+func (m *Map) BatchUpdateChunks(keys, values any, chunkSize int, opts *BatchOptions) (BatchResult, error) {
+	if chunkSize <= 0 {
+		return BatchResult{}, fmt.Errorf("chunk size must be greater than zero")
+	}
+
+	count, err := batchCount(keys, values)
+	if err != nil {
+		return BatchResult{}, err
+	}
+
+	valueMultiplier := 1
+	if m.typ.hasPerCPUValue() {
+		valueMultiplier = MustPossibleCPU()
+	}
+
+	keysValue := reflect.ValueOf(keys)
+	valuesValue := reflect.ValueOf(values)
+
+	var result BatchResult
+	for _, chunk := range batchChunks(count, chunkSize, valueMultiplier) {
+		keyChunk := keysValue.Slice(chunk.KeyStart, chunk.KeyEnd)
+		valueChunk := valuesValue.Slice(chunk.ValueStart, chunk.ValueEnd)
+
+		applied, err := m.BatchUpdate(keyChunk.Interface(), valueChunk.Interface(), opts)
+		if err != nil {
+			result.Failed = result.Completed + applied
+			return result, err
+		}
+
+		result.Completed += chunk.KeyEnd - chunk.KeyStart
+	}
+
+	return result, nil
+}
+
+// BatchDeleteChunks deletes keys in consecutive chunks of at most chunkSize
+// elements. It is a convenience wrapper around BatchDelete for inputs that
+// are too large to process in a single syscall.
+//
+// keys must be a slice. As with BatchUpdateChunks, chunks are independent and
+// non-transactional, and a failure leaves earlier deletions in place. On
+// error the returned BatchResult identifies how many elements were deleted
+// and where processing stopped.
+func (m *Map) BatchDeleteChunks(keys any, chunkSize int, opts *BatchOptions) (BatchResult, error) {
+	if chunkSize <= 0 {
+		return BatchResult{}, fmt.Errorf("chunk size must be greater than zero")
+	}
+
+	count, err := sliceLen(keys)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("keys: %w", err)
+	}
+
+	keysValue := reflect.ValueOf(keys)
+
+	var result BatchResult
+	for _, chunk := range batchChunks(count, chunkSize, 1) {
+		keyChunk := keysValue.Slice(chunk.KeyStart, chunk.KeyEnd)
+
+		applied, err := m.BatchDelete(keyChunk.Interface(), opts)
+		if err != nil {
+			result.Failed = result.Completed + applied
+			return result, err
+		}
+
+		result.Completed += chunk.KeyEnd - chunk.KeyStart
+	}
+
+	return result, nil
+}
+
 // Iterate traverses a map.
 //
 // It's safe to create multiple iterators at the same time.
@@ -1515,6 +1672,8 @@ func (m *Map) Iterate() *MapIterator {
 
 // Close the Map's underlying file descriptor, which could unload the
 // Map from the kernel if it is not pinned or in use by a loaded Program.
+//
+// Close is idempotent: calling it on an already closed Map returns nil.
 func (m *Map) Close() error {
 	if m == nil {
 		// This makes it easier to clean up when iterating maps

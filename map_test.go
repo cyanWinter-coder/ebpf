@@ -202,6 +202,102 @@ func TestMapBatch(t *testing.T) {
 	}
 }
 
+func TestBatchChunks(t *testing.T) {
+	// Evenly divisible input.
+	qt.Assert(t, qt.ContentEquals(batchChunks(6, 2, 1), []batchChunk{
+		{0, 2, 0, 2},
+		{2, 4, 2, 4},
+		{4, 6, 4, 6},
+	}))
+
+	// Trailing partial chunk.
+	qt.Assert(t, qt.ContentEquals(batchChunks(5, 2, 1), []batchChunk{
+		{0, 2, 0, 2},
+		{2, 4, 2, 4},
+		{4, 5, 4, 5},
+	}))
+
+	// Chunk larger than the input.
+	qt.Assert(t, qt.ContentEquals(batchChunks(3, 10, 1), []batchChunk{
+		{0, 3, 0, 3},
+	}))
+
+	// Per-CPU values have PossibleCPU entries per key.
+	qt.Assert(t, qt.ContentEquals(batchChunks(4, 3, 2), []batchChunk{
+		{0, 3, 0, 6},
+		{3, 4, 6, 8},
+	}))
+}
+
+func TestMapBatchUpdateChunks(t *testing.T) {
+	// createMap requires privileges which CI has; skip cleanly where absent.
+	m := createMap(t, Hash, 16)
+
+	keys := []uint32{0, 1, 2, 3, 4, 5, 6}
+	values := make([]uint32, len(keys))
+	for i := range keys {
+		values[i] = keys[i] * 10
+	}
+
+	result, err := m.BatchUpdateChunks(keys, values, 3, nil)
+	testutils.SkipIfNotSupported(t, err)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.Equals(result.Completed, len(keys)))
+	qt.Assert(t, qt.Equals(result.Failed, 0))
+
+	for i, key := range keys {
+		var got uint32
+		qt.Assert(t, qt.IsNil(m.Lookup(key, &got)))
+		qt.Assert(t, qt.Equals(got, values[i]))
+	}
+
+	// A zero chunk size is rejected before touching the map.
+	_, err = m.BatchUpdateChunks(keys, values, 0, nil)
+	qt.Assert(t, qt.IsNotNil(err))
+
+	deleteResult, err := m.BatchDeleteChunks(keys, 3, nil)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.Equals(deleteResult.Completed, len(keys)))
+
+	var got uint32
+	qt.Assert(t, qt.ErrorIs(m.Lookup(keys[0], &got), ErrKeyNotExist))
+}
+
+func TestMapBatchUpdateChunksMapFull(t *testing.T) {
+	// Only two entries fit; filling the map must surface ErrMapFull and the
+	// BatchResult must identify how far the operation got.
+	m := createMap(t, Hash, 2)
+
+	keys := []uint32{0, 1, 2, 3}
+	values := []uint32{10, 20, 30, 40}
+
+	result, err := m.BatchUpdateChunks(keys, values, 2, nil)
+	testutils.SkipIfNotSupported(t, err)
+	if !qt.Check(t, qt.ErrorIs(err, ErrMapFull)) {
+		return
+	}
+	qt.Assert(t, qt.Equals(result.Completed, 2))
+	qt.Assert(t, qt.Equals(result.Failed, 2))
+
+	// The first chunk remains in place, the rest was never attempted.
+	var got uint32
+	qt.Assert(t, qt.IsNil(m.Lookup(keys[0], &got)))
+	qt.Assert(t, qt.Equals(got, uint32(10)))
+	qt.Assert(t, qt.ErrorIs(m.Lookup(keys[2], &got), ErrKeyNotExist))
+}
+
+func TestMapMapFull(t *testing.T) {
+	m := createMap(t, Hash, 1)
+
+	qt.Assert(t, qt.IsNil(m.Put(uint32(0), uint32(1))))
+	err := m.Put(uint32(1), uint32(2))
+	testutils.SkipIfNotSupported(t, err)
+	qt.Assert(t, qt.ErrorIs(err, ErrMapFull))
+
+	// Updating an existing key must not report ErrMapFull.
+	qt.Assert(t, qt.IsNil(m.Put(uint32(0), uint32(3))))
+}
+
 func TestMapBatchUnprivileged(t *testing.T) {
 	arr := createMap(t, Array, 4)
 	hash := createMap(t, Hash, 4)
@@ -314,6 +410,12 @@ func TestMapClose(t *testing.T) {
 
 	if err := m.Close(); err != nil {
 		t.Fatal("Can't close map:", err)
+	}
+
+	// Repeated closes must be a no-op instead of closing an unrelated fd which
+	// may have reused the number.
+	if err := m.Close(); err != nil {
+		t.Fatal("Repeated close returned an error:", err)
 	}
 
 	if err := m.Put(uint32(0), uint32(42)); !errors.Is(err, sys.ErrClosedFd) {
